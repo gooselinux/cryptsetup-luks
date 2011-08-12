@@ -1,0 +1,205 @@
+--- cryptsetup-1.1.2.old/lib/internal.h	2010-05-27 18:32:56.000000000 +0200
++++ cryptsetup-1.1.2/lib/internal.h	2010-08-10 12:25:02.376046189 +0200
+@@ -14,7 +14,8 @@
+ 
+ #define SECTOR_SHIFT		9
+ #define SECTOR_SIZE		(1 << SECTOR_SHIFT)
+-#define DEFAULT_ALIGNMENT	4096
++#define DEFAULT_DISK_ALIGNMENT	1048576 /* 1MiB */
++#define DEFAULT_MEM_ALIGNMENT	4096
+ 
+ #define MAX_TTY_PASSWORD_LEN	512
+ 
+--- cryptsetup-1.1.2.old/lib/setup.c	2010-08-10 12:24:36.000000000 +0200
++++ cryptsetup-1.1.2/lib/setup.c	2010-08-10 12:25:02.386017154 +0200
+@@ -1087,7 +1087,7 @@ static int _crypt_format_luks1(struct cr
+ 			       struct crypt_params_luks1 *params)
+ {
+ 	int r;
+-	unsigned long required_alignment = DEFAULT_ALIGNMENT;
++	unsigned long required_alignment = DEFAULT_DISK_ALIGNMENT;
+ 	unsigned long alignment_offset = 0;
+ 
+ 	if (!cd->device) {
+@@ -1099,7 +1099,7 @@ static int _crypt_format_luks1(struct cr
+ 		required_alignment = params->data_alignment * SECTOR_SIZE;
+ 	else
+ 		get_topology_alignment(cd->device, &required_alignment,
+-				       &alignment_offset, DEFAULT_ALIGNMENT);
++				       &alignment_offset, DEFAULT_DISK_ALIGNMENT);
+ 
+ 	r = LUKS_generate_phdr(&cd->hdr, cd->volume_key, cipher, cipher_mode,
+ 			       (params && params->hash) ? params->hash : "sha1",
+--- cryptsetup-1.1.2.old/lib/utils.c	2010-08-10 12:24:36.000000000 +0200
++++ cryptsetup-1.1.2/lib/utils.c	2010-08-10 12:25:02.386017154 +0200
+@@ -125,12 +125,12 @@ char *safe_strdup(const char *s)
+ 
+ static int get_alignment(int fd)
+ {
+-	int alignment = DEFAULT_ALIGNMENT;
++	int alignment = DEFAULT_MEM_ALIGNMENT;
+ 
+ #ifdef _PC_REC_XFER_ALIGN
+ 	alignment = fpathconf(fd, _PC_REC_XFER_ALIGN);
+ 	if (alignment < 0)
+-		alignment = DEFAULT_ALIGNMENT;
++		alignment = DEFAULT_MEM_ALIGNMENT;
+ #endif
+ 	return alignment;
+ }
+@@ -692,6 +692,7 @@ void get_topology_alignment(const char *
+ {
+ 	int dev_alignment_offset = 0;
+ 	unsigned int min_io_size = 0, opt_io_size = 0;
++	unsigned long temp_alignment = 0;
+ 	int fd;
+ 
+ 	*required_alignment = default_alignment;
+@@ -715,14 +716,16 @@ void get_topology_alignment(const char *
+ 	/* alignment offset, bogus -1 means misaligned/unknown */
+ 	if (ioctl(fd, BLKALIGNOFF, &dev_alignment_offset) == -1 || dev_alignment_offset < 0)
+ 		dev_alignment_offset = 0;
++	*alignment_offset = (unsigned long)dev_alignment_offset;
+ 
+-	if (*required_alignment < (unsigned long)min_io_size)
+-		*required_alignment = (unsigned long)min_io_size;
++	temp_alignment = (unsigned long)min_io_size;
+ 
+-	if (*required_alignment < (unsigned long)opt_io_size)
+-		*required_alignment = (unsigned long)opt_io_size;
++	if (temp_alignment < (unsigned long)opt_io_size)
++		temp_alignment = (unsigned long)opt_io_size;
+ 
+-	*alignment_offset = (unsigned long)dev_alignment_offset;
++	/* If calculated alignment is multiple of default, keep default */
++	if (temp_alignment && (default_alignment % temp_alignment))
++		*required_alignment = temp_alignment;
+ 
+ 	log_dbg("Topology: IO (%u/%u), offset = %lu; Required alignment is %lu bytes.",
+ 		min_io_size, opt_io_size, *alignment_offset, *required_alignment);
+--- cryptsetup-1.1.2.old/luks/keymanage.c	2010-05-27 18:32:10.000000000 +0200
++++ cryptsetup-1.1.2/luks/keymanage.c	2010-08-10 12:25:02.386017154 +0200
+@@ -435,9 +435,9 @@ int LUKS_generate_phdr(struct luks_phdr
+ 	char luksMagic[] = LUKS_MAGIC;
+ 	uuid_t partitionUuid;
+ 	int currentSector;
+-	int alignSectors = LUKS_ALIGN_KEYSLOTS / SECTOR_SIZE;
++
+ 	if (alignPayload == 0)
+-		alignPayload = alignSectors;
++		alignPayload = DEFAULT_DISK_ALIGNMENT / SECTOR_SIZE;
+ 
+ 	memset(header,0,sizeof(struct luks_phdr));
+ 
+@@ -480,12 +480,13 @@ int LUKS_generate_phdr(struct luks_phdr
+ 		return r;
+ 	}
+ 
+-	currentSector = round_up_modulo(LUKS_PHDR_SIZE, alignSectors);
++	currentSector = round_up_modulo(LUKS_PHDR_SIZE, LUKS_ALIGN_KEYSLOTS / SECTOR_SIZE);
+ 	for(i = 0; i < LUKS_NUMKEYS; ++i) {
+ 		header->keyblock[i].active = LUKS_KEY_DISABLED;
+ 		header->keyblock[i].keyMaterialOffset = currentSector;
+ 		header->keyblock[i].stripes = stripes;
+-		currentSector = round_up_modulo(currentSector + blocksPerStripeSet, alignSectors);
++		currentSector = round_up_modulo(currentSector + blocksPerStripeSet,
++						LUKS_ALIGN_KEYSLOTS / SECTOR_SIZE);
+ 	}
+ 	currentSector = round_up_modulo(currentSector, alignPayload);
+ 
+--- cryptsetup-1.1.2.old/man/cryptsetup.8	2010-05-30 18:52:16.000000000 +0200
++++ cryptsetup-1.1.2/man/cryptsetup.8	2010-08-10 12:25:02.386017154 +0200
+@@ -220,9 +220,9 @@ The number of seconds to wait before tim
+ How often the input of the passphrase shall be retried. This option is relevant every time a password is asked, like \fIcreate\fR, \fIluksOpen\fR, \fIluksFormat\fR or \fIluksAddKey\fR. The default is 3 tries.
+ .TP
+ .B "\-\-align-payload=\fIvalue\fR"
+-Align payload at a boundary of \fIvalue\fR 512-byte sectors. This option is relevant for \fIluksFormat\fR.  If your block device lives on a RAID, it is
+-useful to align the filesystem at full stripe boundaries so it can take advantage of the RAID's geometry.  See for instance the sunit and swidth options
+-in the mkfs.xfs manual page. By default, the payload is aligned at an 8 sector (4096 byte) boundary.
++Align payload at a boundary of \fIvalue\fR 512-byte sectors. This option is relevant for \fIluksFormat\fR.
++If not specified, cryptsetup tries to use topology info provided by kernel for underlying device to get optimal alignment.
++If not available (or calculated value is multiple of default) data is by default aligned to 1 MiB boundary (2048 512-byte sectors).
+ .TP
+ .B "\-\-version"
+ Show the version.
+--- cryptsetup-1.1.2.old/tests/align-test	2010-05-27 11:56:28.000000000 +0200
++++ cryptsetup-1.1.2/tests/align-test	2010-08-10 12:25:02.386017154 +0200
+@@ -2,9 +2,11 @@
+ 
+ CRYPTSETUP="../src/cryptsetup"
+ DEV=""
++DEV_STACKED="luks0xbabe"
+ 
+ cleanup() {
+ 	udevadm settle 2>/dev/null 2>&1
++	[ -b /dev/mapper/$DEV_STACKED ] && dmsetup remove $DEV_STACKED 2>/dev/null 2>&1
+ 	rmmod scsi_debug 2>/dev/null
+ 	sleep 2
+ }
+@@ -41,10 +43,10 @@ format() # key_bits expected [forced]
+ {
+ 	if [ -z "$3" ] ; then
+ 		echo -n "Formatting using topology info ($1 bits key)...."
+-		echo xxx| $CRYPTSETUP luksFormat $DEV -q -s $1
++		echo xxx| $CRYPTSETUP luksFormat $DEV -q -i1 -s $1
+ 	else
+-		echo -n "Formatting using forced offset $3 ($1 bits key)..."
+-		echo xxx| $CRYPTSETUP luksFormat $DEV -q -s $1 --align-payload=$2
++		echo -n "Formatting using forced sector alignment $3 ($1 bits key)..."
++		echo xxx| $CRYPTSETUP luksFormat $DEV -q -i1 -s $1 --align-payload=$2
+ 	fi
+ 
+ 	ALIGN=$($CRYPTSETUP luksDump $DEV |grep "Payload offset" | sed -e s/.*\\t//)
+@@ -69,8 +71,10 @@ cleanup
+ echo "# Create desktop-class 4K drive"
+ echo "# (logical_block_size=512, physical_block_size=4096, alignment_offset=0)"
+ add_device dev_size_mb=16 sector_size=512 physblk_exp=3 num_tgts=1
+-format 256 2112
+-format 128 1088
++format 256 4096
++format 256 2112 8
++format 128 2048
++format 128 1088 8
+ format 256 8192 8192
+ format 128 8192 8192
+ cleanup
+@@ -78,25 +82,30 @@ cleanup
+ echo "# Create desktop-class 4K drive w/ 63-sector DOS partition compensation"
+ echo "# (logical_block_size=512, physical_block_size=4096, alignment_offset=3584)"
+ add_device dev_size_mb=16 sector_size=512 physblk_exp=3 lowest_aligned=7 num_tgts=1
+-format 256 2119
+-format 128 1095
++format 256 4103
++format 256 2119 8
++format 128 2055
++format 128 1095 8
+ cleanup
+ 
+ echo "# Create enterprise-class 4K drive"
+ echo "# (logical_block_size=4096, physical_block_size=4096, alignment_offset=0)"
+ add_device dev_size_mb=16 sector_size=4096 num_tgts=1
+-format 256 2560
+-format 128 1536 
++format 256 4096
++format 256 2560 8
++format 128 2048
++format 128 1536 8
+ cleanup
+ 
+ echo "# Create classic 512b drive and stack dm-linear"
+ echo "# (logical_block_size=512, physical_block_size=512, alignment_offset=0)"
+ add_device dev_size_mb=16 sector_size=512 num_tgts=1
+ DEV2=$DEV
+-DEV=/dev/mapper/luks0xbabe
+-dmsetup create luks0xbabe --table "0 32768 linear $DEV2 0"
+-format 256 2112
+-format 128 1088
++DEV=/dev/mapper/$DEV_STACKED
++dmsetup create $DEV_STACKED --table "0 32768 linear $DEV2 0"
++format 256 4096
++format 256 2112 8
++format 128 2048
++format 128 1088 8
+ format 128 8192 8192
+-dmsetup remove luks0xbabe
+ cleanup
